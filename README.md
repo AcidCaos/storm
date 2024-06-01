@@ -26,6 +26,7 @@ options:
   -p, --port-start PORT     Number of concurrent circuits to establish
   -T, --tor-bin PATH        Tor binary path
   -D, --debug               Print debugger messages
+  -H, --headers HEADERS     Headers JSON file
 
 mode:
     ddos                    DDOS attack mode
@@ -50,4 +51,5 @@ down options:
   -o, --output-dir PATH     Where the downloaded files are saved
   -s, --chunk-size SIZE     Size (in bytes) of the download chunks
   -m, --max-attempts N      Max number of attempts to download a file
+  -c, --chunking            Download files by chunks. HTTP server must accept HEAD method
 ```

